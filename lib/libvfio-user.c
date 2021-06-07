@@ -508,15 +508,9 @@ handle_dma_map(vfu_ctx_t *vfu_ctx, vfu_msg_t *msg,
         dma_map->flags &= ~VFIO_USER_F_DMA_REGION_WRITE;
     }
 
-    if (dma_map->flags == VFIO_USER_F_DMA_REGION_MAPPABLE) {
-        fd = consume_fd(msg->in_fds, msg->nr_in_fds, 0);
-        if (fd < 0) {
-            vfu_log(vfu_ctx, LOG_ERR,
-                    "failed to add DMA region %s: mappable but fd not provided",
-                    rstr);
-            return -1;
-        }
-    } else if (dma_map->flags != 0) {
+    fd = consume_fd(msg->in_fds, msg->nr_in_fds, 0);
+
+    if (dma_map->flags != 0) {
         vfu_log(vfu_ctx, LOG_ERR, "bad flags=%#x", dma_map->flags);
     }
 
