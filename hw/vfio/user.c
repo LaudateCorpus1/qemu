@@ -126,10 +126,21 @@ void vfio_user_recv(void *opaque)
         goto err;
     }
 
+    switch (msg.flags & VFIO_USER_TYPE) {
+    case VFIO_USER_REQUEST:
+        isreply = 0;
+        break;
+    case VFIO_USER_REPLY:
+        isreply = 1;
+        break;
+    default:
+        error_setg(&local_err, "vfio_user_recv unknown message type");
+        goto err;
+    }
+
     /*
      * For replies, find the matching pending request
      */
-    isreply = (msg.flags & VFIO_USER_TYPE) == VFIO_USER_REPLY;
     if (isreply) {
          QTAILQ_FOREACH(reply, &proxy->pending, next) {
             if (msg.id == reply->id) {
@@ -215,7 +226,7 @@ void vfio_user_recv(void *opaque)
          */
         if (proxy->state != CLOSING) {
             ret = proxy->request(proxy->reqarg, buf, &reqfds);
-            if (ret < 0) {
+            if (ret < 0 && !(msg.flags & VFIO_USER_NO_REPLY)) {
                 vfio_user_send_reply(proxy, buf, ret);
             }
         }
@@ -879,7 +890,7 @@ int vfio_user_set_irqs(VFIODevice *vbasedev, struct vfio_irq_set *irq)
      * Send in chunks if over max_send_fds
      */
     for (sent_fds = 0; nfds > sent_fds; sent_fds += send_fds) {
-        VFIOUserFDs loop_fds;
+        VFIOUserFDs *arg_fds, loop_fds;
 
 	/* must send all valid FDs or all invalid FDs in single msg */
         send_fds = irq_howmany((int *)irq->data, sent_fds, nfds - sent_fds);
@@ -894,8 +905,9 @@ int vfio_user_set_irqs(VFIODevice *vbasedev, struct vfio_irq_set *irq)
         loop_fds.send_fds = send_fds;
         loop_fds.recv_fds = 0;
         loop_fds.fds = (int *)irq->data + sent_fds;
+        arg_fds = loop_fds.fds[0] != -1 ? &loop_fds : NULL;
 
-        vfio_user_send_recv(vbasedev->proxy, &msgp->hdr, &loop_fds, 0);
+        vfio_user_send_recv(vbasedev->proxy, &msgp->hdr, arg_fds, 0);
         if (msgp->hdr.flags & VFIO_USER_ERROR) {
             g_free(msgp);
             return -msgp->hdr.error_reply;

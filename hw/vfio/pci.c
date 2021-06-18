@@ -3432,7 +3432,8 @@ static int vfio_user_dma_write(VFIOPCIDevice *vdev, struct vfio_user_dma_rw *msg
     PCIDevice *pdev = &vdev->pdev;
     char *buf = (char *)msg + sizeof(*msg);
 
-    if (msg->count > vfio_user_max_xfer()) {
+    /* make sure transfer count isn't larger than the message data */
+    if (msg->count > msg->hdr.size - sizeof(*msg)) {
         return -E2BIG;
     }
 
@@ -3683,6 +3684,9 @@ static Property vfio_user_pci_dev_properties[] = {
     DEFINE_PROP_BOOL("secure-dma", VFIOUserPCIDevice, secure, false),
     DEFINE_PROP_BOOL("x-enable-migration", VFIOPCIDevice,
                      vbasedev.enable_migration, false),
+    DEFINE_PROP_ON_OFF_AUTO("x-pre-copy-dirty-page-tracking", VFIOPCIDevice,
+                            vbasedev.pre_copy_dirty_page_tracking,
+                            ON_OFF_AUTO_ON),
     DEFINE_PROP_END_OF_LIST(),
 };
 
