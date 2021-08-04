@@ -94,7 +94,8 @@ typedef struct VFIOUserReply {
     int rsize;
     uint32_t id;
     QemuCond cv;
-    uint8_t complete;
+    bool complete;
+    bool nowait;
 } VFIOUserReply;
 
 enum proxy_state {
@@ -120,6 +121,7 @@ typedef struct VFIOProxy {
     QemuMutex lock;
     QTAILQ_HEAD(, VFIOUserReply) free;
     QTAILQ_HEAD(, VFIOUserReply) pending;
+    VFIOUserReply *last_nowait;
     enum proxy_state state;
     int close_wait;
 } VFIOProxy;
@@ -260,10 +262,11 @@ int vfio_user_region_read(VFIODevice *vbasedev, uint32_t index, uint64_t offset,
 int vfio_user_region_write(VFIODevice *vbasedev, uint32_t index,
                            uint64_t offset, uint32_t count, void *data);
 int vfio_user_dma_map(VFIOProxy *proxy, struct vfio_iommu_type1_dma_map *map,
-                      VFIOUserFDs *fds);
+                      VFIOUserFDs *fds, bool will_commit);
 int vfio_user_dma_unmap(VFIOProxy *proxy,
                         struct vfio_iommu_type1_dma_unmap *unmap,
-                        struct vfio_bitmap *bitmap);
+                        struct vfio_bitmap *bitmap, bool will_commit);
+void vfio_user_drain_reqs(VFIOProxy *proxy);
 int vfio_user_get_region_info(VFIODevice *vbasedev, int index,
                               struct vfio_region_info *info, VFIOUserFDs *fds);
 uint64_t vfio_user_max_xfer(void);

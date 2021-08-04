@@ -40,7 +40,12 @@ static void vfio_user_shutdown(VFIOProxy *proxy);
 static void vfio_user_request_msg(vfio_user_hdr_t *hdr, uint16_t cmd,
                                   uint32_t size, uint32_t flags);
 static void vfio_user_send_recv(VFIOProxy *proxy, vfio_user_hdr_t *msg,
-                                VFIOUserFDs *fds, int rsize);
+                                VFIOUserFDs *fds, int rsize, int flags);
+
+/* vfio_user_send_recv flags */
+#define NOWAIT		0x1  /* do not wait for reply */
+#define NOIOLOCK	0x2  /* do not drop iolock */
+
 
 uint64_t vfio_user_max_xfer(void)
 {
@@ -69,11 +74,13 @@ static void vfio_user_request_msg(vfio_user_hdr_t *hdr, uint16_t cmd,
 
 static int wait_time = 1000;   /* wait 1 sec for replies */
 
+extern bool memory_region_has_pending(void);
+
 static void vfio_user_send_recv(VFIOProxy *proxy, vfio_user_hdr_t *msg,
-                                VFIOUserFDs *fds, int rsize)
+                                VFIOUserFDs *fds, int rsize, int flags)
 {
     VFIOUserReply *reply;
-    bool iolock = qemu_mutex_iothread_locked();
+    bool iolock = 0;
 
     if (msg->flags & VFIO_USER_NO_REPLY) {
         error_printf("vfio_user_send_recv on async message\n");
@@ -81,13 +88,17 @@ static void vfio_user_send_recv(VFIOProxy *proxy, vfio_user_hdr_t *msg,
     }
 
     /*
-     * We will block later, so use a per-proxy lock and let
-     * the iothreads run while we sleep.
+     * We may block later, so use a per-proxy lock and let
+     * the iothreads run while we sleep unless told no to
      */
-    if (iolock) {
-        qemu_mutex_unlock_iothread();
-    }
     qemu_mutex_lock(&proxy->lock);
+    if (!(flags & NOIOLOCK)) {
+        iolock = qemu_mutex_iothread_locked();
+        if (iolock) {
+            assert(!memory_region_has_pending());
+            qemu_mutex_unlock_iothread();
+        }
+    }
 
     reply = QTAILQ_FIRST(&proxy->free);
     if (reply != NULL) {
@@ -104,17 +115,24 @@ static void vfio_user_send_recv(VFIOProxy *proxy, vfio_user_hdr_t *msg,
     QTAILQ_INSERT_TAIL(&proxy->pending, reply, next);
 
     vfio_user_send_locked(proxy, msg, fds);
-    if ((msg->flags & VFIO_USER_ERROR) == 0) {
-        while (reply->complete == 0) {
-            if (!qemu_cond_timedwait(&reply->cv, &proxy->lock, wait_time)) {
-                msg->flags |= VFIO_USER_ERROR;
-                msg->error_reply = ETIMEDOUT;
-                break;
+    if (!(msg->flags & VFIO_USER_ERROR)) {
+        if (!(flags & NOWAIT)) {
+            while (reply->complete == 0) {
+                if (!qemu_cond_timedwait(&reply->cv, &proxy->lock, wait_time)) {
+                    msg->flags |= VFIO_USER_ERROR;
+                    msg->error_reply = ETIMEDOUT;
+                    break;
+                }
             }
+            QTAILQ_INSERT_HEAD(&proxy->free, reply, next);
+        } else {
+            reply->nowait = 1;
+            proxy->last_nowait = reply;
         }
+    } else {
+        QTAILQ_INSERT_HEAD(&proxy->free, reply, next);
     }
 
-    QTAILQ_INSERT_HEAD(&proxy->free, reply, next);
     qemu_mutex_unlock(&proxy->lock);
     if (iolock) {
         qemu_mutex_lock_iothread();
@@ -265,11 +283,27 @@ void vfio_user_recv(void *opaque)
      * Replies signal a waiter, requests get processed by vfio code
      * that may assume the iothread lock is held.
      */
-    qemu_mutex_unlock(&proxy->lock);
     if (isreply) {
         reply->complete = 1;
-        qemu_cond_signal(&reply->cv);
+        if (!reply->nowait) {
+            qemu_cond_signal(&reply->cv);
+        } else {
+            if (msg.flags & VFIO_USER_ERROR) {
+                error_printf("vfio_user_rcv error reply on async request ");
+                error_printf("command %x error %s\n", msg.command,
+                             strerror(msg.error_reply));
+            }
+            /* just free it if no one is waiting */
+            reply->nowait = 0;
+            if (proxy->last_nowait == reply) {
+                proxy->last_nowait = NULL;
+            }
+            g_free(reply->msg);
+            QTAILQ_INSERT_HEAD(&proxy->free, reply, next);
+        }
+        qemu_mutex_unlock(&proxy->lock);
     } else {
+        qemu_mutex_unlock(&proxy->lock);
         qemu_mutex_lock_iothread();
         /*
          * make sure proxy wasn't closed while we waited
@@ -284,14 +318,13 @@ void vfio_user_recv(void *opaque)
         }
         qemu_mutex_unlock_iothread();
     }
-
     return;
+
  fatal:
     vfio_user_shutdown(proxy);
     proxy->state = RECV_ERROR;
 
  err:
-    qemu_mutex_unlock(&proxy->lock);
     for (i = 0; i < numfds; i++) {
         close(fdp[i]);
     }
@@ -302,6 +335,7 @@ void vfio_user_recv(void *opaque)
         reply->complete = 1;
         qemu_cond_signal(&reply->cv);
     }
+    qemu_mutex_unlock(&proxy->lock);
     error_report_err(local_err);
 }
 
@@ -327,6 +361,7 @@ static void vfio_user_send_locked(VFIOProxy *proxy, vfio_user_hdr_t *msg,
         numfds = fds->send_fds;
         fdp = fds->fds;
     }
+
     ret = qio_channel_writev_full(proxy->ioc, &iov, 1, fdp, numfds, &local_err);
     if (ret < 0) {
         goto err;
@@ -353,17 +388,10 @@ static void vfio_user_send_locked(VFIOProxy *proxy, vfio_user_hdr_t *msg,
 static void vfio_user_send(VFIOProxy *proxy, vfio_user_hdr_t *msg,
                            VFIOUserFDs *fds)
 {
-    bool iolock = qemu_mutex_iothread_locked();
 
-    if (iolock) {
-        qemu_mutex_unlock_iothread();
-    }
     qemu_mutex_lock(&proxy->lock);
     vfio_user_send_locked(proxy, msg, fds);
     qemu_mutex_unlock(&proxy->lock);
-    if (iolock) {
-        qemu_mutex_lock_iothread();
-    }
 }
 
 struct cap_entry {
@@ -528,7 +556,7 @@ int vfio_user_validate_version(VFIODevice *vbasedev, Error **errp)
     memcpy(&msgp->capabilities, caps->str, caplen);
     g_string_free(caps, true);
 
-    vfio_user_send_recv(vbasedev->proxy, &msgp->hdr, NULL, 0);
+    vfio_user_send_recv(vbasedev->proxy, &msgp->hdr, NULL, 0, 0);
     if (msgp->hdr.flags & VFIO_USER_ERROR) {
         error_setg_errno(errp, msgp->hdr.error_reply, "version reply");
         return -1;
@@ -554,7 +582,7 @@ int vfio_user_get_info(VFIODevice *vbasedev)
     vfio_user_request_msg(&msg.hdr, VFIO_USER_DEVICE_GET_INFO, sizeof(msg), 0);
     msg.argsz = sizeof(struct vfio_device_info);
 
-    vfio_user_send_recv(vbasedev->proxy, &msg.hdr, NULL, 0);
+    vfio_user_send_recv(vbasedev->proxy, &msg.hdr, NULL, 0, 0);
     if (msg.hdr.flags & VFIO_USER_ERROR) {
         return -msg.hdr.error_reply;
     }
@@ -684,7 +712,7 @@ int vfio_user_get_irq_info(VFIODevice *vbasedev, struct vfio_irq_info *info)
     msg.argsz = info->argsz;
     msg.index = info->index;
 
-    vfio_user_send_recv(vbasedev->proxy, &msg.hdr, NULL, 0);
+    vfio_user_send_recv(vbasedev->proxy, &msg.hdr, NULL, 0, 0);
     if (msg.hdr.flags & VFIO_USER_ERROR) {
         return -msg.hdr.error_reply;
     }
@@ -706,7 +734,7 @@ int vfio_user_region_read(VFIODevice *vbasedev, uint32_t index, uint64_t offset,
     msgp->region = index;
     msgp->count = count;
 
-    vfio_user_send_recv(vbasedev->proxy, &msgp->hdr, NULL, size);
+    vfio_user_send_recv(vbasedev->proxy, &msgp->hdr, NULL, size, 0);
     if (msgp->hdr.flags & VFIO_USER_ERROR) {
         return -msgp->hdr.error_reply;
     } else if (msgp->count > count) {
@@ -739,38 +767,48 @@ int vfio_user_region_write(VFIODevice *vbasedev, uint32_t index,
 }
 
 int vfio_user_dma_map(VFIOProxy *proxy, struct vfio_iommu_type1_dma_map *map,
-                      VFIOUserFDs *fds)
+                      VFIOUserFDs *fds, bool will_commit)
 {
-    struct vfio_user_dma_map msg;
-    int ret;
+    struct vfio_user_dma_map *msgp = g_malloc(sizeof(*msgp));
+    int ret, flags;
 
-    vfio_user_request_msg(&msg.hdr, VFIO_USER_DMA_MAP, sizeof(msg), 0);
-    msg.argsz = map->argsz;
-    msg.flags = map->flags;
-    msg.offset = map->vaddr;
-    msg.iova = map->iova;
-    msg.size = map->size;
+    /* commit will wait, so send async without dropping iolock */
+    flags = will_commit ? (NOIOLOCK | NOWAIT) : 0;
 
-    vfio_user_send_recv(proxy, &msg.hdr, fds, 0);
-    ret = (msg.hdr.flags & VFIO_USER_ERROR) ? -msg.hdr.error_reply : 0;
+    vfio_user_request_msg(&msgp->hdr, VFIO_USER_DMA_MAP, sizeof(*msgp), 0);
+    msgp->argsz = map->argsz;
+    msgp->flags = map->flags;
+    msgp->offset = map->vaddr;
+    msgp->iova = map->iova;
+    msgp->size = map->size;
+
+    vfio_user_send_recv(proxy, &msgp->hdr, fds, 0, flags);
+    ret = (msgp->hdr.flags & VFIO_USER_ERROR) ? -msgp->hdr.error_reply : 0;
+
+    if (!(flags & NOWAIT)) {
+        g_free(msgp);
+    }
     return ret;
 }
 
 int vfio_user_dma_unmap(VFIOProxy *proxy,
                         struct vfio_iommu_type1_dma_unmap *unmap,
-                        struct vfio_bitmap *bitmap)
+                        struct vfio_bitmap *bitmap, bool will_commit)
 {
-    g_autofree struct {
+    struct {
         struct vfio_user_dma_unmap msg;
         struct vfio_user_bitmap bitmap;
     } *msgp = NULL;
-    int msize, rsize;
+    int msize, rsize, flags;
 
     if (bitmap == NULL && (unmap->flags &
                            VFIO_DMA_UNMAP_FLAG_GET_DIRTY_BITMAP)) {
         error_printf("vfio_user_dma_unmap mismatched flags and bitmap\n");
         return -EINVAL;
     }
+
+    /* can't drop iolock until commit */
+    flags = will_commit ? NOIOLOCK : 0;
 
     /*
      * If a dirty bitmap is returned, allocate extra space for it
@@ -783,26 +821,75 @@ int vfio_user_dma_unmap(VFIOProxy *proxy,
         msgp->bitmap.pgsize = bitmap->pgsize;
         msgp->bitmap.size = bitmap->size;
     } else {
+        /* can only send async if no bitmap returned */
+        flags |= will_commit ? NOWAIT : 0;
         msize = rsize = sizeof(struct vfio_user_dma_unmap);
         msgp = g_malloc0(rsize);
     }
 
-    vfio_user_request_msg(&msgp->msg.hdr, VFIO_USER_DMA_UNMAP, msize, 0);
+    vfio_user_request_msg(&msgp->msg.hdr, VFIO_USER_DMA_UNMAP, msize, flags);
     msgp->msg.argsz = unmap->argsz;
     msgp->msg.flags = unmap->flags;
     msgp->msg.iova = unmap->iova;
     msgp->msg.size = unmap->size;
 
-    vfio_user_send_recv(proxy, &msgp->msg.hdr, NULL, rsize);
+    vfio_user_send_recv(proxy, &msgp->msg.hdr, NULL, rsize, flags);
     if (msgp->msg.hdr.flags & VFIO_USER_ERROR) {
+        g_free(msgp);
         return -msgp->msg.hdr.error_reply;
     }
 
     if (bitmap != NULL) {
         memcpy(bitmap->data, &msgp->bitmap.data, bitmap->size);
     }
+    if (!(flags & NOWAIT)) {
+        g_free(msgp);
+    }
 
     return 0;
+}
+
+void vfio_user_drain_reqs(VFIOProxy *proxy)
+{
+    VFIOUserReply *reply;
+    bool iolock = 0;
+
+    /*
+     * Any DMA map/unmap requests sent in the middle
+     * of a memory region transaction were sent async.
+     * Wait for them here.
+     */
+    qemu_mutex_lock(&proxy->lock);
+    if (proxy->last_nowait != NULL) {
+        iolock = qemu_mutex_iothread_locked();
+        if (iolock) {
+            assert(!memory_region_has_pending());
+            qemu_mutex_unlock_iothread();
+        }
+
+        reply = proxy->last_nowait;
+        reply->nowait = 0;
+        while (reply->complete == 0) {
+            if (!qemu_cond_timedwait(&reply->cv, &proxy->lock, wait_time)) {
+                error_printf("vfio_drain_reqs - timed out\n");
+                break;
+            }
+        }
+
+        if (reply->msg->flags & VFIO_USER_ERROR) {
+            error_printf("vfio_user_rcv error reply on async request ");
+            error_printf("command %x error %s\n", reply->msg->command,
+                         strerror(reply->msg->error_reply));
+        }
+        proxy->last_nowait = NULL;
+        g_free(reply->msg);
+        QTAILQ_INSERT_HEAD(&proxy->free, reply, next);
+    }
+
+    qemu_mutex_unlock(&proxy->lock);
+    if (iolock) {
+        qemu_mutex_lock_iothread();
+    }
 }
 
 int vfio_user_get_region_info(VFIODevice *vbasedev, int index,
@@ -829,7 +916,7 @@ int vfio_user_get_region_info(VFIODevice *vbasedev, int index,
     msgp->argsz = info->argsz;
     msgp->index = info->index;
 
-    vfio_user_send_recv(vbasedev->proxy, &msgp->hdr, fds, size);
+    vfio_user_send_recv(vbasedev->proxy, &msgp->hdr, fds, size, 0);
     if (msgp->hdr.flags & VFIO_USER_ERROR) {
         return -msgp->hdr.error_reply;
     }
@@ -893,7 +980,7 @@ int vfio_user_set_irqs(VFIODevice *vbasedev, struct vfio_irq_set *irq)
         msgp->start = irq->start;
         msgp->count = irq->count;
 
-        vfio_user_send_recv(vbasedev->proxy, &msgp->hdr, NULL, 0);
+        vfio_user_send_recv(vbasedev->proxy, &msgp->hdr, NULL, 0, 0);
         if (msgp->hdr.flags & VFIO_USER_ERROR) {
             return -msgp->hdr.error_reply;
         }
@@ -930,7 +1017,7 @@ int vfio_user_set_irqs(VFIODevice *vbasedev, struct vfio_irq_set *irq)
         loop_fds.fds = (int *)irq->data + sent_fds;
         arg_fds = loop_fds.fds[0] != -1 ? &loop_fds : NULL;
 
-        vfio_user_send_recv(vbasedev->proxy, &msgp->hdr, arg_fds, 0);
+        vfio_user_send_recv(vbasedev->proxy, &msgp->hdr, arg_fds, 0, 0);
         if (msgp->hdr.flags & VFIO_USER_ERROR) {
             return -msgp->hdr.error_reply;
         }
@@ -945,7 +1032,7 @@ void vfio_user_reset(VFIODevice *vbasedev)
 
     vfio_user_request_msg(&msg, VFIO_USER_DEVICE_RESET, sizeof(msg), 0);
 
-    vfio_user_send_recv(vbasedev->proxy, &msg, NULL, 0);
+    vfio_user_send_recv(vbasedev->proxy, &msg, NULL, 0, 0);
     if (msg.flags & VFIO_USER_ERROR) {
         error_printf("reset reply error %d\n", msg.error_reply);
     }
@@ -983,7 +1070,7 @@ int vfio_user_dirty_bitmap(VFIOProxy *proxy,
     msgp->msg.argsz = msize - sizeof(msgp->msg.hdr);
     msgp->msg.flags = cmd->flags;
 
-    vfio_user_send_recv(proxy, &msgp->msg.hdr, NULL, rsize);
+    vfio_user_send_recv(proxy, &msgp->msg.hdr, NULL, rsize, 0);
     if (msgp->msg.hdr.flags & VFIO_USER_ERROR) {
         return -msgp->msg.hdr.error_reply;
     }

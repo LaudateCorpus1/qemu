@@ -41,6 +41,13 @@ static bool memory_region_update_pending;
 static bool ioeventfd_update_pending;
 bool global_dirty_log;
 
+bool memory_region_has_pending(void);
+
+bool memory_region_has_pending(void)
+{
+    return memory_region_transaction_depth || memory_region_update_pending;
+}
+
 static QTAILQ_HEAD(, MemoryListener) memory_listeners
     = QTAILQ_HEAD_INITIALIZER(memory_listeners);
 

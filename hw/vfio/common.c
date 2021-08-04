@@ -427,6 +427,7 @@ static int vfio_dma_unmap_bitmap(VFIOContainer *container,
     struct vfio_iommu_type1_dma_unmap *unmap;
     struct vfio_bitmap *bitmap;
     uint64_t pages = REAL_HOST_PAGE_ALIGN(size) / qemu_real_host_page_size;
+    bool will_commit = container->will_commit;
     int ret;
 
     unmap = g_malloc0(sizeof(*unmap) + sizeof(*bitmap));
@@ -461,7 +462,7 @@ static int vfio_dma_unmap_bitmap(VFIOContainer *container,
     }
 
     if (container->proxy != NULL) {
-        ret = vfio_user_dma_unmap(container->proxy, unmap, bitmap);
+        ret = vfio_user_dma_unmap(container->proxy, unmap, bitmap, will_commit);
     } else {
         ret = ioctl(container->fd, VFIO_IOMMU_UNMAP_DMA, unmap);
     }
@@ -491,6 +492,7 @@ static int vfio_dma_unmap(VFIOContainer *container,
         .iova = iova,
         .size = size,
     };
+    bool will_commit = container->will_commit;
 
     if (iotlb && container->dirty_pages_supported &&
         vfio_devices_all_running_and_saving(container)) {
@@ -498,7 +500,7 @@ static int vfio_dma_unmap(VFIOContainer *container,
     }
 
     if (container->proxy != NULL) {
-        return vfio_user_dma_unmap(container->proxy, &unmap, NULL);
+        return vfio_user_dma_unmap(container->proxy, &unmap, NULL, will_commit);
     }
 
     while (ioctl(container->fd, VFIO_IOMMU_UNMAP_DMA, &unmap)) {
@@ -537,6 +539,7 @@ static int vfio_dma_map(VFIOContainer *container, MemoryRegion *mr, hwaddr iova,
         .iova = iova,
         .size = size,
     };
+    bool will_commit = container->will_commit;
 
     if (!readonly) {
         map.flags |= VFIO_DMA_MAP_FLAG_WRITE;
@@ -553,10 +556,10 @@ static int vfio_dma_map(VFIOContainer *container, MemoryRegion *mr, hwaddr iova,
             fds.fds = &fd;
             map.vaddr = qemu_ram_block_host_offset(mr->ram_block, vaddr);
 
-            return vfio_user_dma_map(container->proxy, &map, &fds);
+            return vfio_user_dma_map(container->proxy, &map, &fds, will_commit);
         } else {
             map.vaddr = 0;
-            return vfio_user_dma_map(container->proxy, &map, NULL);
+            return vfio_user_dma_map(container->proxy, &map, NULL, will_commit);
         }
     }
 
@@ -918,6 +921,24 @@ static void vfio_unregister_ram_discard_listener(VFIOContainer *container,
     ram_discard_manager_unregister_listener(rdm, &vrdl->listener);
     QLIST_REMOVE(vrdl, next);
     g_free(vrdl);
+}
+
+static void vfio_listener_begin(MemoryListener *listener)
+{
+    VFIOContainer *container = container_of(listener, VFIOContainer, listener);
+
+    container->will_commit = 1;
+}
+
+static void vfio_listener_commit(MemoryListener *listener)
+{
+    VFIOContainer *container = container_of(listener, VFIOContainer, listener);
+
+    /* wait for any async requests sent during the transaction */
+    if (container->proxy != NULL) {
+        vfio_user_drain_reqs(container->proxy);
+    }
+    container->will_commit = 0;
 }
 
 static void vfio_listener_region_add(MemoryListener *listener,
@@ -1508,6 +1529,8 @@ static void vfio_listener_log_sync(MemoryListener *listener,
 }
 
 static const MemoryListener vfio_memory_listener = {
+    .begin = vfio_listener_begin,
+    .commit = vfio_listener_commit,
     .region_add = vfio_listener_region_add,
     .region_del = vfio_listener_region_del,
     .log_global_start = vfio_listener_log_global_start,
